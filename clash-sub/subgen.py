@@ -141,11 +141,19 @@ def build_clash(proxies) -> str:
     pubkeys = load_reality_pubkeys()
     for p in proxies:
         ro = p.get("reality-opts")
-        if isinstance(ro, dict) and not ro.get("public-key"):
+        if not isinstance(ro, dict):
+            continue
+        if not ro.get("public-key"):
             pk = pubkeys.get(int(p.get("port", 0))) or REALITY_PUBLIC_KEY
             if pk:
                 ro["public-key"] = pk
                 log.info("injected public-key into %s (port %s)", p.get("name"), p.get("port"))
+        # support-x25519mlkem768 是 Xray 26 客户端的握手提示：客户端据此主动
+        # 提供 mlkem768 公钥。mihomo 的 Reality 实现不认这个流程，留着可能
+        # 协商出与 Xray 26 服务端不兼容的握手，直接剥掉强制经典 x25519
+        # （服务端已实测接受经典握手：服务器本机穿透测试 204）。
+        if ro.pop("support-x25519mlkem768", None) is not None:
+            log.info("stripped support-x25519mlkem768 from %s", p.get("name"))
     for p in proxies:
         if p.get("reality-opts") and not p["reality-opts"].get("public-key"):
             raise ValueError(
