@@ -1,0 +1,33 @@
+# nginx：反代面板 + 订阅，并给面板登录接口加限流
+#
+# 端口分工（都要在云安全组放行）：
+#   443   -> Reality 节点，由 x-ui/Xray 占用，nginx 不碰
+#   8080  -> nginx，对外提供 panel.<domain> 与 sub.<domain>
+#   11297 -> x-ui 面板，改成只监听 127.0.0.1 后不再对外
+#
+# 注意：nginx 与 x-ui 都使用 host 网络，因此 proxy_pass 走 127.0.0.1。
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    network_mode: host
+    restart: unless-stopped
+    # 注意：跨 compose 文件不能写 depends_on（会报 "undefined service"）。
+    # 先后顺序由 deploy.sh 控制，nginx 启动失败会自动重启直到 x-ui 就绪。
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/cert:/etc/nginx/cert:ro
+    healthcheck:
+      # 用 127.0.0.1 探测，避免依赖 DNS
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

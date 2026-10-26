@@ -1,0 +1,16 @@
+# 真实配置含 AccessKey，绝不入库
+.env
+
+# 数据库含面板账号、客户端 UUID、订阅 Sub ID
+x-ui/db/*
+!x-ui/db/.gitkeep
+
+# 证书与私钥
+nginx/cert/*
+!nginx/cert/.gitkeep
+x-ui/cert/*
+!x-ui/cert/.gitkeep
+
+# 备份
+*.tar.gz
+*backup*

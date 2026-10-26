@@ -1,0 +1,33 @@
+# 3x-ui 面板 + Xray 节点 + 订阅服务
+#
+# 重要：本容器使用 host 网络模式。
+# 原因：Reality 需要在 443 上直接处理 TLS 指纹，桥接网络会额外做一次 NAT，
+# 且容器内无法正确读取客户端的真实源 IP（会影响 fail2ban 与限流）。
+# host 模式下 `network_mode: host`，因此不要同时写 ports 段。
+services:
+  x-ui:
+    image: ghcr.io/mhsanaei/3x-ui:latest
+    container_name: x-ui
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # 时区，影响面板日志与流量统计的重置时间
+      TZ: Asia/Shanghai
+      # 面板数据库位置（容器内路径，映射到 ./x-ui/db）
+      XUI_DB_FOLDER: /etc/x-ui
+    volumes:
+      - ./x-ui/db:/etc/x-ui
+      - ./x-ui/cert:/root/cert
+    # 健康检查：面板走 HTTPS，用 -k 跳过证书校验
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'x-ui' > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        # 1G 内存机器必须限制日志，否则会占满磁盘
+        max-size: "10m"
+        max-file: "3"

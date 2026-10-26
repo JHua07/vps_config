@@ -1,0 +1,10 @@
+# 这些文件必须在 Linux 上保持 LF，否则 shell 脚本会报
+# "bad interpreter: /usr/bin/env bash^M: no such file or directory"
+*.sh        text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+*.example   text eol=lf
+Dockerfile  text eol=lf
+
+# 文档用平台默认即可
+*.md        text
