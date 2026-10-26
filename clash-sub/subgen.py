@@ -13,10 +13,13 @@ URL 约定（与原 3x-ui 订阅保持一致，老客户端无需改地址）：
 """
 
 import http.server
+import base64
+import json
 import logging
 import os
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +37,12 @@ TEMPLATE_FILE = os.environ.get("TEMPLATE", "/opt/clash-sub/template.yaml")
 XUI_DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+# reality public-key 兜底（按端口匹配不到时用）
+REALITY_PUBLIC_KEY = os.environ.get("REALITY_PUBLIC_KEY", "")
+# xray 二进制：用于从私钥推导 reality 公钥（权威实现）
+XRAY_BIN = os.environ.get(
+    "XRAY_BIN", "/usr/local/x-ui/bin/xray-linux-amd64"
+)
 
 log = logging.getLogger("subgen")
 
@@ -126,6 +135,24 @@ def build_clash(proxies) -> str:
     if not proxies:
         raise ValueError("no proxies")
 
+    # 3x-ui 生成的 reality 节点缺 public-key（新版 mihomo 强校验，缺了直接报错）。
+    # 用 xray 二进制从入站私钥推导——Xray 自己是权威实现，避免自己实现 X25519
+    # 与其新版本（mlkem768 等）的推导差异。
+    pubkeys = load_reality_pubkeys()
+    for p in proxies:
+        ro = p.get("reality-opts")
+        if isinstance(ro, dict) and not ro.get("public-key"):
+            pk = pubkeys.get(int(p.get("port", 0))) or REALITY_PUBLIC_KEY
+            if pk:
+                ro["public-key"] = pk
+                log.info("injected public-key into %s (port %s)", p.get("name"), p.get("port"))
+    for p in proxies:
+        if p.get("reality-opts") and not p["reality-opts"].get("public-key"):
+            raise ValueError(
+                f"proxy {p.get('name')} has reality-opts without public-key "
+                f"and no matching reality inbound/private key"
+            )
+
     with open(TEMPLATE_FILE, encoding="utf-8") as f:
         tmpl = f.read()
 
@@ -181,6 +208,62 @@ def watch_cert():
         if cur != last:
             log.info("certificate changed, restarting")
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+
+
+# ---------- reality 公钥推导 ----------
+_pubkey_cache = {}
+
+
+def xray_derive_pubkey(priv_b64url: str) -> str:
+    """调用 xray 从私钥推导 reality 公钥。
+
+    不自己实现 X25519：Xray 新版引入 mlkem768 等变体后，"Password (PublicKey)"
+    的推导由 Xray 自己定义，二进制是唯一权威。结果缓存。
+    """
+    if priv_b64url in _pubkey_cache:
+        return _pubkey_cache[priv_b64url]
+    if not os.path.exists(XRAY_BIN):
+        raise FileNotFoundError(f"xray binary not found: {XRAY_BIN}")
+    r = subprocess.run(
+        [XRAY_BIN, "x25519", "-i", priv_b64url],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"xray x25519 failed: {r.stderr.strip()[:200]}")
+    pub = None
+    for line in r.stdout.splitlines():
+        # 兼容 "Password (PublicKey): xxx" 与旧版 "Public key: xxx"
+        for marker in ("Password (PublicKey):", "Public key:"):
+            if marker in line:
+                pub = line.split(":", 1)[1].strip()
+                break
+    if not pub:
+        raise ValueError(f"cannot parse xray output: {r.stdout[:200]}")
+    _pubkey_cache[priv_b64url] = pub
+    log.info("derived reality pubkey from xray: %s...", pub[:8])
+    return pub
+
+
+def load_reality_pubkeys():
+    """端口 -> reality 公钥。从 x-ui DB 的入站 streamSettings 推导。"""
+    out = {}
+    try:
+        c = sqlite3.connect(f"file:{XUI_DB}?mode=ro", uri=True)
+        for port, stream in c.execute(
+            "select port, stream_settings from inbounds where protocol='vless'"
+        ):
+            try:
+                ss = json.loads(stream)
+                rs = ss.get("realitySettings") or {}
+                priv = rs.get("privateKey")
+                if priv:
+                    out[int(port)] = xray_derive_pubkey(priv)
+            except Exception as e:
+                log.warning("derive pubkey for port %s failed: %s", port, e)
+        c.close()
+    except Exception as e:
+        log.warning("read inbounds for pubkeys failed: %s", e)
+    return out
 
 
 # ---------- HTTP ----------

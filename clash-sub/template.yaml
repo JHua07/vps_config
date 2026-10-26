@@ -11,6 +11,8 @@
 #   5. 广告 DOMAIN-KEYWORD 拦截（比 geosite 更早生效）
 #   6. sniffer 增加 force-dns-mapping / parse-pure-ip
 #   7. 增加 NTP（Reality 对时间敏感）
+#   8. 移除 global-client-fingerprint（新版 mihomo 已删除该配置，
+#      fingerprint 由 x-ui 生成的节点自带 client-fingerprint 提供）
 
 # ---------- 基础 ----------
 mixed-port: 7890
@@ -21,7 +23,6 @@ ipv6: false
 unified-delay: true
 tcp-concurrent: true
 find-process-mode: strict
-global-client-fingerprint: chrome
 keep-alive-interval: 30
 
 profile:
