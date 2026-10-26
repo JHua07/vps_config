@@ -53,7 +53,7 @@ chmod +x deploy.sh && ./deploy.sh
 |---|---|
 | `DEPLOYMENT.md` | 完整文档 |
 | `.env.example` | 配置模板（复制为 `.env` 后填写） |
-| `deploy.sh` | 容器化部署脚本 |
+|  容器化部署脚本| 容器化部署脚本 |
 | `docker-compose.x-ui.yml` | 面板 + Xray + 订阅 |
 | `docker-compose.nginx.yml` | 反代 + 登录限流 |
 | `nginx/conf.d/panel.conf` | nginx 配置 |

@@ -565,6 +565,69 @@ openssl s_client -connect IP:443 -servername www.apple.com </dev/null 2>/dev/nul
 
 ## 订阅配置
 
+### 让订阅返回完整配置（subgen）
+
+3x-ui 的订阅**只含节点列表**：Clash 路径返回的 YAML 只有 20 多行，
+`rules` 仅有 `MATCH,PROXY`，没有 DNS 段、代理组、性能项。
+这与商业机场差距最大的部分。
+
+3x-ui 自带的 `subClashRules` 注入**只能补 rules，补不了 DNS 和 sniffer**。
+
+解决方案是 `clash-sub/` 里的 **subgen** 服务：
+
+```
+Clash 客户端
+    │ https://IP:8080/<subClashPath>/<SubID>     （地址与原 3x-ui 完全一致）
+    ▼
+subgen (:8080, 对外, TLS)
+    │ 拉取 https://127.0.0.1:2096/<subClashPath>/<SubID>   （仅内网）
+    │ 提取 proxies，注入 DNS / proxy-groups / rules / 性能项
+    ▼
+返回完整 Clash YAML（约 190 行）
+```
+
+**部署**：
+
+```bash
+./deploy-clash-sub.sh
+```
+
+脚本会自动：把 x-ui 订阅收归 `127.0.0.1:2096`（对外端口 8080 让给 subgen，
+**不需要改云安全组**）→ 安装 systemd 服务 → 用真实 SubID 验收。
+
+**subgen 提供的配置**（见 `clash-sub/template.yaml`）：
+
+- DNS：fake-ip 模式，国内外域名分流解析（`nameserver-policy` 按 `geosite` 区分），
+  `proxy-server-nameserver` 单独指定避免解析死循环
+- 分流规则：GEOSITE/GEOIP 内置规则——局域网直连、广告拦截、国内直连、国外走代理
+- 代理组：手动选择 / 自动选择（url-test）/ 故障转移（fallback）
+- 性能项：`unified-delay`、`tcp-concurrent`、`global-client-fingerprint`
+- sniffer：域名嗅探，配合 fake-ip 修正分流依据
+- GEO 数据自动更新（每 168 小时）
+
+**两种格式的行为**：
+
+| 路径 | 行为 |
+|---|---|
+| `<subClashPath>/<SubID>` | 完整 Clash YAML |
+| `<subPath>/<SubID>` | 3x-ui 原始 base64 直通（v2rayN 等用） |
+
+地址与原 3x-ui 完全一致，已导入的客户端无需改任何东西。
+
+**证书更新**：acme.sh 续期后 subgen 通过监控证书文件 mtime 自动原地重启（`os.execv`），
+不需要额外配置 reloadcmd。
+
+**调试**：`journalctl -u clash-sub -n 50 --no-pager`
+
+**踩过的坑**（写代码时实际犯的错，改模板时注意）：
+
+1. 模板**注释里不要出现 `{{PROXIES}}` 字样**——`str.replace` 会把注释里的
+   占位符也替换掉，注入的节点块从注释中间展开，YAML 直接解析失败。
+   subgen 已改为只替换「整行占位符」。
+2. `yaml.safe_dump(单个字典)` 不带列表的 `- ` 标记，逐节点 dump 后要手动在
+   首行补 `  - `，否则 `proxies` 会被解析成映射而不是列表。
+3. 上游要拉 **Clash 路径**（返回 YAML），不是 base64 路径（返回编码文本）。
+
 ### 数据库中的关键字段
 
 ```bash

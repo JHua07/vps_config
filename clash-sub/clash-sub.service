@@ -1,0 +1,20 @@
+[Unit]
+Description=Clash subscription generator (wraps 3x-ui sub with full config)
+Documentation=https://github.com/JHua07/vps_config
+# x-ui 必须先起来，否则内部订阅拉不到
+After=network-online.target x-ui.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/clash-sub/subgen.py
+Restart=always
+RestartSec=3
+# 1G 内存机器的保险丝
+MemoryMax=80M
+MemoryHigh=64M
+# 挂了或被 OOM 杀掉都自动拉起
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target

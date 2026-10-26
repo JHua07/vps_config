@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Clash 订阅生成服务。
+
+把 3x-ui 的原始订阅（仅含节点列表）包装成完整 Clash 配置：
+DNS / 分流规则 / 代理组 / 性能项，输出与商业机场一致。
+
+监听 0.0.0.0:8080 对外，从 127.0.0.1:2096 拉取 3x-ui 订阅（仅内网可达）。
+
+URL 约定（与原 3x-ui 订阅保持一致，老客户端无需改地址）：
+  /<subClashPath>/<SubID>  -> 完整 Clash YAML
+  /<subPath>/<SubID>       -> 3x-ui 原始 base64 直通
+  /healthz                 -> 健康检查
+"""
+
+import http.server
+import logging
+import os
+import sqlite3
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import yaml
+
+# ---------- 配置（环境变量可覆盖） ----------
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+INTERNAL_BASE = os.environ.get("INTERNAL_BASE", "")  # 留空则从 DB 读
+CERT_FILE = os.environ.get("CERT_FILE", "/root/cert/ip/fullchain.pem")
+KEY_FILE = os.environ.get("KEY_FILE", "/root/cert/ip/privkey.pem")
+TEMPLATE_FILE = os.environ.get("TEMPLATE", "/opt/clash-sub/template.yaml")
+XUI_DB = os.environ.get("XUI_DB", "/etc/x-ui/x-ui.db")
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+
+log = logging.getLogger("subgen")
+
+# ---------- 从 x-ui DB 读取订阅路径与内部端口 ----------
+def load_settings():
+    """返回 (internal_base, base64_path, clash_path)。读不到时用保守默认值。"""
+    base = INTERNAL_BASE
+    b64, clash = "/sub/", "/clash/"
+    try:
+        c = sqlite3.connect(f"file:{XUI_DB}?mode=ro", uri=True)
+        rows = dict(c.execute("select key,value from settings"))
+        c.close()
+        port = rows.get("subPort", "2096")
+        listen = (rows.get("subListen") or "").strip() or "127.0.0.1"
+        if not base:
+            base = f"https://{listen}:{port}"
+        b64 = rows.get("subPath") or b64
+        clash = rows.get("subClashPath") or clash
+    except Exception as e:  # DB 不可用时仍可启动，靠环境变量
+        log.warning("read x-ui db failed: %s", e)
+    if not base:
+        base = "https://127.0.0.1:2096"
+    return base, _norm(b64), _norm(clash)
+
+
+def _norm(path):
+    """统一为 /xxx/ 形式，保证 startswith 判断可靠"""
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    return path
+
+
+INTERNAL_BASE, B64_PATH, CLASH_PATH = load_settings()
+log.info("internal=%s base64=%s clash=%s", INTERNAL_BASE, B64_PATH, CLASH_PATH)
+
+# ---------- 上游拉取（带缓存，按 SubID 区分） ----------
+_cache = {}          # subid -> {"ts","body","headers"}
+_lock = threading.Lock()
+_last_err = {}       # subid -> str
+
+INSECURE_CTX = ssl.create_default_context()
+INSECURE_CTX.check_hostname = False
+INSECURE_CTX.verify_mode = ssl.CERT_NONE
+
+
+def fetch_upstream(path):
+    """从 3x-ui 订阅服务拉取。返回 (status, body, headers)。"""
+    req = urllib.request.Request(
+        INTERNAL_BASE + path, headers={"User-Agent": "subgen/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=10, context=INSECURE_CTX) as r:
+        return r.status, r.read(), dict(r.headers)
+
+
+def get_clash_config(subid: str):
+    """按 SubID 生成完整配置。优先缓存，上游失败时回退旧数据。"""
+    now = time.time()
+    ent = _cache.get(subid)
+    if ent and ent["body"] and now - ent["ts"] < CACHE_TTL and subid not in _last_err:
+        return ent["body"], ent["headers"]
+    try:
+        # 拉 Clash 路径：返回的 YAML 自带 proxies 段，直接提取节点。
+        # （base64 路径返回的是编码文本，不能直接解析）
+        status, body, headers = fetch_upstream(CLASH_PATH + subid)
+        if status != 200:
+            raise RuntimeError(f"upstream {status}")
+        doc = yaml.safe_load(body.decode("utf-8", "replace"))
+        proxies = (doc or {}).get("proxies")
+        if not proxies:
+            raise ValueError("upstream has no proxies")
+        clash = build_clash(proxies)
+        with _lock:
+            _cache[subid] = {"ts": now, "body": clash.encode("utf-8"), "headers": headers}
+            _last_err.pop(subid, None)
+        return _cache[subid]["body"], _cache[subid]["headers"]
+    except Exception as e:
+        log.error("build failed for %s: %s", subid, e)
+        with _lock:
+            _last_err[subid] = str(e)
+            if ent and ent["body"]:
+                # 回退旧配置，保证订阅不断供
+                return ent["body"], ent["headers"]
+        raise
+
+
+def build_clash(proxies) -> str:
+    """把节点列表注入模板，生成完整配置"""
+    if not proxies:
+        raise ValueError("no proxies")
+
+    with open(TEMPLATE_FILE, encoding="utf-8") as f:
+        tmpl = f.read()
+
+    # 节点段：逐个 dump 再统一缩进。safe_dump(单字典) 不含列表的 "- " 标记，
+    # 需要手动补在首行，否则整段会被解析成映射而不是列表
+    p_lines = []
+    for p in proxies:
+        chunk = yaml.safe_dump(
+            p, allow_unicode=True, sort_keys=False, default_flow_style=False
+        ).rstrip().splitlines()
+        p_lines.append("  - " + chunk[0])
+        p_lines.extend("    " + line for line in chunk[1:])
+
+    names = [str(p["name"]) for p in proxies if p.get("name")]
+    n_lines = ['      - "%s"' % n.replace('"', '\\"') for n in names]
+
+    # 只替换「整行占位符」，注释里出现相同字样不会误伤
+    import re
+
+    out = re.sub(r"^\{\{PROXIES\}\}[ \t]*$", "\n".join(p_lines), tmpl, flags=re.M)
+    out = re.sub(
+        r"^\{\{PROXY_NAMES\}\}[ \t]*$", "\n".join(n_lines), out, flags=re.M
+    )
+    if "{{PROXIES}}" in out or "{{PROXY_NAMES}}" in out:
+        raise ValueError("template placeholder not replaced (standalone line missing)")
+
+    # 校验生成结果合法，坏配置不能发出去
+    check = yaml.safe_load(out)
+    if not isinstance(check, dict) or not check.get("proxies"):
+        raise ValueError("generated config invalid")
+
+    log.info(
+        "built config: %d proxies, %d rules, %d bytes",
+        len(proxies), len(check.get("rules") or []), len(out),
+    )
+    return out
+
+
+# ---------- 证书热更新 ----------
+def cert_mtime():
+    try:
+        return os.stat(CERT_FILE).st_mtime, os.stat(KEY_FILE).st_mtime
+    except OSError:
+        return None
+
+
+def watch_cert():
+    """acme.sh 续期只重启 x-ui，这里自己监控证书变化并原地重启进程"""
+    last = cert_mtime()
+    while True:
+        time.sleep(60)
+        cur = cert_mtime()
+        if cur != last:
+            log.info("certificate changed, restarting")
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+
+
+# ---------- HTTP ----------
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "subgen/1.0"
+
+    def log_message(self, fmt, *args):
+        log.info("%s %s", self.address_string(), fmt % args)
+
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+
+        if path == "/healthz":
+            self._send(200, b"ok\n")
+            return
+
+        if path.startswith(CLASH_PATH) or path.startswith(B64_PATH):
+            passthrough = path.startswith(B64_PATH)
+            try:
+                if passthrough:
+                    status, body, headers = fetch_upstream(path)
+                    if status != 200:
+                        self._send(502, b"upstream error")
+                        return
+                    extra = {
+                        "Subscription-Userinfo": headers.get(
+                            "Subscription-Userinfo", ""
+                        ),
+                        "Profile-Update-Interval": headers.get(
+                            "Profile-Update-Interval", "12"
+                        ),
+                    }
+                    self._send(200, body, "text/plain; charset=utf-8", extra)
+                else:
+                    subid = path[len(CLASH_PATH):].strip("/")
+                    body, headers = get_clash_config(subid)
+                    extra = {
+                        "Subscription-Userinfo": headers.get(
+                            "Subscription-Userinfo", ""
+                        ),
+                        "Profile-Update-Interval": headers.get(
+                            "Profile-Update-Interval", "12"
+                        ),
+                        "Profile-Title": "base64:" + __import__("base64").b64encode(
+                            "自建节点".encode()
+                        ).decode(),
+                    }
+                    self._send(
+                        200, body, "application/yaml; charset=utf-8", extra
+                    )
+            except Exception as e:
+                self._send(503, ("subscription unavailable: %s" % e).encode())
+            return
+
+        self._send(404, b"not found\n")
+
+    do_HEAD = do_GET
+
+
+class TLSServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    threading.Thread(target=watch_cert, daemon=True).start()
+
+    httpd = TLSServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+
+    log.info("listening on %s:%d (tls)", LISTEN_HOST, LISTEN_PORT)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
