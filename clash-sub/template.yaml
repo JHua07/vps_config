@@ -1,7 +1,16 @@
-# 完整 Clash 配置模板
+# 完整 Clash 配置模板（v2，借鉴 4 个机场配置后的改进版）
 #
-# 生成时会把节点列表注入到下方「proxies:」段，并把节点名注入各 proxy-group。
+# 生成时把节点列表注入到下方「proxies:」段，并把节点名注入各 proxy-group。
 # 规则用 mihomo 内置 GEOSITE / GEOIP，不需要额外的 rule-providers 下载。
+#
+# v2 相比 v1 的改动（来源见 DEPLOYMENT.md）：
+#   1. 修复 GEOIP,CN 误加 no-resolve 导致未知国内站点走代理的 bug
+#   2. AI 服务（openai/claude/anthropic/perplexity/copilot）显式分流
+#   3. Telegram IP-CIDR 规则（TG 用硬编码 IP，域名规则抓不到）
+#   4. 苹果/微软服务独立分组，默认直连（国内 CDN 更快）
+#   5. 广告 DOMAIN-KEYWORD 拦截（比 geosite 更早生效）
+#   6. sniffer 增加 force-dns-mapping / parse-pure-ip
+#   7. 增加 NTP（Reality 对时间敏感）
 
 # ---------- 基础 ----------
 mixed-port: 7890
@@ -14,13 +23,21 @@ tcp-concurrent: true
 find-process-mode: strict
 global-client-fingerprint: chrome
 keep-alive-interval: 30
-disable-keep-alive: false
 
 profile:
   store-selected: true
   store-fake-ip: true
 
-# ---------- TUN（可选，客户端可自行开关）----------
+# ---------- NTP ----------
+# Reality 对时间敏感，客户端时间漂移会导致握手失败
+ntp:
+  enable: true
+  server: ntp.aliyun.com
+  port: 123
+  interval: 30
+  write-to-system: false
+
+# ---------- TUN（客户端可自行开关）----------
 tun:
   enable: false
   stack: mixed
@@ -30,10 +47,6 @@ tun:
     - any:53
 
 # ---------- DNS ----------
-# 关键点：
-#   - 国内域名用国内 DoH，国外域名用代理侧 DoH，避免污染和泄漏
-#   - fake-ip 模式，配合 GEOSITE 规则效率最高
-#   - proxy-server-nameserver 单独指定，避免节点域名解析走自身形成死循环
 dns:
   enable: true
   listen: 127.0.0.1:1053
@@ -55,6 +68,13 @@ dns:
     - "+.market.xiaomi.com"
     - "localhost.ptlogin2.qq.com"
     - "localhost.sec.qq.com"
+    - "+.qq.com"
+    - "+.weixin.qq.com"
+    - "+.music.163.com"
+    - "+.126.net"
+    - "+.kuwo.cn"
+    - "+.y.qq.com"
+    - "+.kugou.com"
     - "+.stun.*.*"
     - "+.stun.*.*.*"
     - "+.srv.nintendo.net"
@@ -70,6 +90,7 @@ dns:
   proxy-server-nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
+  # 国外域名用国外 DoH 解析，防止 DNS 污染（借鉴网际快车/MiMoe）
   nameserver-policy:
     "geosite:private":
       - https://dns.alidns.com/dns-query
@@ -83,9 +104,11 @@ dns:
       - https://dns.google/dns-query
 
 # ---------- sniffer ----------
-# 配合 fake-ip 使用：把 TLS SNI / HTTP Host 还原成真实域名再走规则
+# 配合 fake-ip：把 TLS SNI / HTTP Host 还原成真实域名再走规则
 sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
   sniff:
     TLS:
       ports: [443, 8443]
@@ -112,7 +135,6 @@ proxies:
 {{PROXIES}}
 
 # ---------- 代理组 ----------
-# 手动选择 / 自动选择（延迟最低）/ 故障转移
 proxy-groups:
   - name: "🚀 节点选择"
     type: select
@@ -139,6 +161,38 @@ proxy-groups:
     proxies:
 {{PROXY_NAMES}}
 
+  # AI 服务检测访问地区，且必须防 DNS 污染，独立分组便于切换
+  - name: "🤖 AI 服务"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "DIRECT"
+
+  - name: "📲 电报消息"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "DIRECT"
+
+  - name: "🎬 流媒体"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "🎯 全球直连"
+
+  # 苹果/微软在国内有 CDN，默认直连更快；被墙的服务（如 Copilot）单独走 AI 组
+  - name: "🍎 苹果服务"
+    type: select
+    proxies:
+      - DIRECT
+      - "🚀 节点选择"
+
+  - name: "Ⓜ️ 微软服务"
+    type: select
+    proxies:
+      - DIRECT
+      - "🚀 节点选择"
+
   - name: "🎯 全球直连"
     type: select
     proxies:
@@ -160,18 +214,69 @@ proxy-groups:
 # ---------- 规则 ----------
 # 顺序即优先级：先精确后宽泛，最后 MATCH 兜底
 rules:
-  # 局域网 / 私有地址直连
+  # 局域网 / 私有地址直连（no-resolve：私有地址不需要解析）
   - GEOIP,LAN,DIRECT,no-resolve
   - GEOSITE,private,DIRECT
 
-  # 广告
+  # 广告：关键字规则先于 geosite 生效（借鉴 MiMoe）
+  - DOMAIN-KEYWORD,admarvel,🛑 广告拦截
+  - DOMAIN-KEYWORD,admaster,🛑 广告拦截
+  - DOMAIN-KEYWORD,adsage,🛑 广告拦截
+  - DOMAIN-KEYWORD,adsmogo,🛑 广告拦截
+  - DOMAIN-KEYWORD,adsrvmedia,🛑 广告拦截
+  - DOMAIN-KEYWORD,adwords,🛑 广告拦截
+  - DOMAIN-KEYWORD,adservice,🛑 广告拦截
+  - DOMAIN-KEYWORD,trackers,🛑 广告拦截
   - GEOSITE,category-ads-all,🛑 广告拦截
 
-  # 常见国内服务直连（避免绕路）
-  - GEOSITE,cn,🎯 全球直连
-  - GEOIP,CN,🎯 全球直连,no-resolve
+  # AI 服务：必须走代理且防 DNS 污染（借鉴网际快车，放最前）
+  - DOMAIN-SUFFIX,openai.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,chatgpt.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,oaistatic.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,oaiusercontent.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,claude.ai,🤖 AI 服务
+  - DOMAIN-SUFFIX,anthropic.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,perplexity.ai,🤖 AI 服务
+  - DOMAIN-SUFFIX,gemini.google.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,copilot.microsoft.com,🤖 AI 服务
+  - DOMAIN-SUFFIX,api.githubcopilot.com,🤖 AI 服务
+  - GEOSITE,openai,🤖 AI 服务
+  - GEOSITE,anthropic,🤖 AI 服务
 
-  # 国外走代理
+  # Telegram：客户端用硬编码 IP，必须加 IP-CIDR（借鉴网际快车/MiMoe）
+  - GEOSITE,telegram,📲 电报消息
+  - IP-CIDR,91.108.4.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,91.108.8.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,91.108.12.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,91.108.16.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,91.108.20.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,91.108.56.0/22,📲 电报消息,no-resolve
+  - IP-CIDR,149.154.160.0/20,📲 电报消息,no-resolve
+  - IP-CIDR6,2001:b28:f23d::/48,📲 电报消息,no-resolve
+  - IP-CIDR6,2001:b28:f23f::/48,📲 电报消息,no-resolve
+  - IP-CIDR6,2001:67c:4e8::/48,📲 电报消息,no-resolve
+
+  # 流媒体
+  - GEOSITE,netflix,🎬 流媒体
+  - GEOSITE,youtube,🎬 流媒体
+  - GEOSITE,spotify,🎬 流媒体
+  - GEOSITE,tiktok,🎬 流媒体
+  - GEOSITE,disney,🎬 流媒体
+
+  # 苹果/微软：默认直连（国内 CDN），被墙服务已在上面被 AI 组截走
+  - GEOSITE,apple,🍎 苹果服务
+  - GEOSITE,microsoft,Ⓜ️ 微软服务
+
+  # 谷歌走代理
+  - GEOSITE,google,🚀 节点选择
+
+  # 国内直连
+  - GEOSITE,cn,🎯 全球直连
+  # 注意：这里不能加 no-resolve——geosite 没收录的国内站点
+  # 靠这条规则解析出 CN 归属后直连（v1 的 bug）
+  - GEOIP,CN,🎯 全球直连
+
+  # 剩余已知的国外域名
   - GEOSITE,geolocation-!cn,🚀 节点选择
 
   # 兜底
